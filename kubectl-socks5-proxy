@@ -56,8 +56,8 @@ run_proxy(){
   # Install an SOCKS5 proxy server if not yet installed
   r=$(kubectl get pod ${podname} -n ${namespace} 2>/dev/null | tail -1 | awk '{print $1}') # 
   if [ "${r}" != "${podname}" ];then
-    echo "Creating SOCKS5 Proxy (Pod)..."
-    cat <<EOF | kubectl apply -n ${namespace} -f -
+    echo "Creating yaml file..."
+    cat > /tmp/proxysocks5.yaml <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -73,7 +73,8 @@ spec:
   nodeSelector:
     "kubernetes.io/os": linux
 EOF
-
+    echo "Creating SOCKS5 Proxy (Pod)..."
+    kubectl apply -n ${namespace} -f /tmp/proxysocks5.yaml
     # Wait until SOCKS5 proxy server gets ready
     c=1
     while [[ ${c} -le ${MAX_POD_CREATION_TIME} ]];
