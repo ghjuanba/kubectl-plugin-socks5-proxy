@@ -10,6 +10,7 @@ DEFAULT_POD_PORT=1080
 DEFAULT_LOCAL_PORT=1080
 DEFAULT_NAME=psocks${DEFAULT_POD_PORT}
 DEFAULT_PROXY_NAMESPACE=default
+
 DEFAULT_PROXY_IMAGE=serjs/go-socks5-proxy
 DEFAULT_CONTEXT=$( kubectl config current-context )
 
@@ -90,6 +91,7 @@ spec:
   nodeSelector:
     "kubernetes.io/os": linux
 EOF
+
     # Wait until SOCKS5 proxy server gets ready
     c=1
     while [[ ${c} -le ${MAX_POD_CREATION_TIME} ]];
@@ -185,6 +187,7 @@ plugin_main() {
 
   # Cleaning up SOCKS5 proxy server if needed
   [[ "${skip_cleanup_proxy}" == "no" ]] && cleanup_proxy "${namespace}" "${podname}" "${context}"
+
 }
 
 plugin_main "$@"
