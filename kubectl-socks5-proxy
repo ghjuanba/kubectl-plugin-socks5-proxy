@@ -3,18 +3,24 @@
 # A kubectl plugin that creates a local SOCKS5 proxy through which you can access to pods/services in a Kubernetes cluster
 #
 
-[[ -n $DEBUG ]] && set -x -e
+[[ -n "$DEBUG" ]] && set -x -e
 
 MAX_POD_CREATION_TIME=10  # unit: second
-DEFAULT_NAME=$(echo ${USER}-proxy|sed -e 's/[^[:alnum:]|-]//g'|tr '[:upper:]' '[:lower:]')
-DEFAULT_PORT=1080
+DEFAULT_POD_PORT=1080
+DEFAULT_LOCAL_PORT=1080
+DEFAULT_NAME=psocks${DEFAULT_POD_PORT}
 DEFAULT_PROXY_NAMESPACE=default
 DEFAULT_PROXY_IMAGE=serjs/go-socks5-proxy
+DEFAULT_CONTEXT=$( kubectl config current-context )
+
+_echo(){
+  echo "$@" >&2
+}
 
 help(){
-  echo "Usage: "
-  echo "  kubectl socks5-proxy"
-  echo ""
+  _echo "Usage: "
+  _echo "  kubectl socks5-proxy"
+  _echo ""
   options
 }
 
@@ -24,10 +30,8 @@ Options:
   -n, --namespace <namespace>   Namespace to create SOCKS5 proxy server in
                                 Default: ${DEFAULT_PROXY_NAMESPACE}
 
-  -p, --port <local port>       Local port to be forwarded to the SOCKS5 proxy server (Pod)
-                                A client connects to this port, then the connection is forwarded to the 
-                                SOCKS5 proxy server, which is then forwareded to the destination server
-                                Default: ${DEFAULT_PORT}
+  -p, --pod-port <pod port>     SOCKS5 proxy server POD port
+                                Default: ${DEFAULT_POD_PORT}
 
   -N, --name <pod name>         Name to give the pod in the cluster
                                 Default: ${DEFAULT_NAME}
@@ -35,8 +39,16 @@ Options:
   -i, --image <socks5 image>    Set the image used as socks5 proxy server
                                 Default: ${DEFAULT_PROXY_IMAGE}
 
-  --skip-cleanup-proxy          Skip cearning up SOCKS5 proxy pod
+  --skip-cleanup-proxy          Skip cleaning up SOCKS5 proxy pod
                                 Default: Cleaning up SOCKS5 proxy pod at the end
+
+  -c, --context <k8s context>   Set context to run the proxy
+                                DEFAULT: Current context set in kubectl
+
+  -l, --local-port <local port> Local port to be forwarded to the SOCKS5 proxy server Pod port
+                                A client connects to this port, then the connection is forwarded to the
+                                SOCKS5 proxy server, which is then forwarded to the destination server
+                                Default: ${DEFAULT_LOCAL_PORT}
 
   -h, --help                    Show this message
 EOF
@@ -44,20 +56,25 @@ EOF
 
 cleanup_proxy(){
   local namespace="$1"
-  echo "Clearning up SOCKS5 proxy server (Pod)..."
-  kubectl delete pod ${podname} -n ${namespace}
+  local podname="$2"
+  local context="$3"
+  _echo "Cleaning up SOCKS5 proxy server (Pod) ([${context}]--[${namespace}]--${podname})..."
+  kubectl --context=${context} delete pod ${podname} -n ${namespace}
 }
 
 run_proxy(){
   local namespace="$1"
-  local port="$2"
-  local image="$3"
+  local podport="$2"
+  local podname="$3"
+  local image="$4"
+  local localport="$5"
+  local context="$6"
 
-  # Install an SOCKS5 proxy server if not yet installed
-  r=$(kubectl get pod ${podname} -n ${namespace} 2>/dev/null | tail -1 | awk '{print $1}') # 
+  # Install a SOCKS5 proxy server if not yet installed
+  r=$(kubectl --context=${context} get pod ${podname} -n ${namespace} 2>/dev/null | tail -1 | awk '{print $1}')
   if [ "${r}" != "${podname}" ];then
-    echo "Creating SOCKS5 Proxy (Pod)..."
-    cat <<EOF | kubectl apply -n ${namespace} -f -
+    _echo "Creating SOCKS5 Proxy (Pod)..."
+    cat <<EOF | kubectl --context=${context} apply -n ${namespace} -f -
 apiVersion: v1
 kind: Pod
 metadata:
@@ -69,16 +86,15 @@ spec:
   - name: ${podname}
     image: ${image}
     ports:
-    - containerPort: 1080
+    - containerPort: ${podport}
   nodeSelector:
     "kubernetes.io/os": linux
 EOF
-
     # Wait until SOCKS5 proxy server gets ready
     c=1
     while [[ ${c} -le ${MAX_POD_CREATION_TIME} ]];
     do
-      pod_status=$(kubectl get pod ${podname} -n ${namespace} 2>/dev/null | tail -1 | awk '{print $3}')
+      pod_status=$(kubectl --context=${context} get pod ${podname} -n ${namespace} 2>/dev/null | tail -1 | awk '{print $3}')
       if [ "${pod_status}" = "Running" ]; then
         break
       fi
@@ -87,14 +103,15 @@ EOF
     done
   fi
 
-  echo "Starting a local SOCKS5 Proxy (localhost:${port})..."
-  echo ""
-  echo "The proxy Pod can be cleaned up with ^C (if not in background),"
-  echo "or with a command \"kubectl delete pod ${podname} -n ${namespace}\""
-  echo ""
+  _echo "Starting a local SOCKS5 Proxy (localhost:${localport}) --> ([${context}]--[${namespace}]--${podname}:${podport})..."
+  _echo ""
+  _echo "The proxy Pod can be cleaned up with ^C (if not in background),"
+  _echo "or with a command \"kubectl --context=${context} delete pod ${podname} -n ${namespace}\""
+  _echo ""
   # Setup portforward
-  kubectl port-forward -n ${namespace} ${podname} $port:1080 
+  kubectl --context=${context} port-forward -n ${namespace} ${podname} ${localport}:${podport}
 }
+
 
 plugin_main() {
   skip_cleanup_proxy=no
@@ -112,8 +129,8 @@ plugin_main() {
         namespace=$2
         nSkip=2
       ;;
-      "-p" | "--port" )
-        port=$2
+      "-p" | "--pod-port" )
+        podport=$2
         nSkip=2
       ;;
       "-N" | "--name" )
@@ -124,6 +141,14 @@ plugin_main() {
         image=$2
         nSkip=2
       ;;
+      "-c" | "--context" )
+        context=$2
+        nSkip=2
+      ;;
+      "-l" | "--local-port" )
+        localport=$2
+        nSkip=2
+      ;;
       *)
         help >&2
         exit 1
@@ -132,38 +157,34 @@ plugin_main() {
     shift $nSkip
   done
 
-  if [[ "$(type kubectl &>/dev/null; echo $?)" -eq 1 ]]; then
-    echo "Error: missing kubectl command" >&2
-    echo "Please install kubectl (https://kubernetes.io/docs/tasks/tools/install-kubectl/)" >&2
+  type kubectl &>/dev/null || {
+    _echo "Error: missing kubectl command" >&2
+    _echo "Please install kubectl (https://kubernetes.io/docs/tasks/tools/install-kubectl/)" >&2
     exit 1
-  fi
+  }
 
-  if [ ! -n "${namespace}" ]; then
-    namespace=${DEFAULT_PROXY_NAMESPACE}
-  fi
-  echo "using: namespace=${namespace}"
+  [[ -z "${context}" ]] && context=${DEFAULT_CONTEXT}
+  _echo "using: context=${context}"
 
-  if [ ! -n "${port}" ]; then
-    port=${DEFAULT_PORT}
-  fi
-  echo "using: port=${port}"
+  [[ -z "${namespace}" ]] && namespace=${DEFAULT_PROXY_NAMESPACE}
+  _echo "using: namespace=${namespace}"
 
-  if [ ! -n "${podname}" ]; then
-    podname=${DEFAULT_NAME}
-  fi
-  echo "using: name=${podname}"
+  [[ -z "${podport}" ]] && podport=${DEFAULT_POD_PORT}
+  _echo "using: POD port=${podport}"
 
-  if [ ! -n "${image}" ]; then
-    image=${DEFAULT_PROXY_IMAGE}
-  fi
-  echo "using: image=${image}"
+  [[ -z "${localport}" ]] && localport=${DEFAULT_LOCAL_PORT}
+  _echo "using: LOCAL port=${localport}"
 
-  run_proxy "${namespace}" "${port}" "${image}"
+  [[ -z "${podname}" ]] && podname=${DEFAULT_NAME}
+  _echo "using: name=${podname}"
+
+  [[ -z "${image}" ]] && image=${DEFAULT_PROXY_IMAGE}
+  _echo "using: image=${image}"
+
+  run_proxy "${namespace}" "${podport}" "${podname}" "${image}" "${localport}" "${context}"
 
   # Cleaning up SOCKS5 proxy server if needed
-  if [ "${skip_cleanup_proxy}" = "no" ]; then
-    cleanup_proxy "${namespace}"
-  fi
+  [[ "${skip_cleanup_proxy}" == "no" ]] && cleanup_proxy "${namespace}" "${podname}" "${context}"
 }
 
 plugin_main "$@"
